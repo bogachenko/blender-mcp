@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ipaddress
 import logging
 import os
 import threading
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 from . import server as blender_server
 
@@ -60,16 +64,45 @@ def _install_blender_command_serialization() -> None:
     blender_server._http_serialization_installed = True
 
 
-def create_app():
+def _has_blender_connection() -> bool:
+    connection = blender_server._blender_connection
+    return bool(connection is not None and connection.sock is not None)
+
+
+async def _ensure_blender_connection() -> bool:
+    """Create the persistent Blender socket connection when the add-on is available."""
+    if _has_blender_connection():
+        return True
+
+    try:
+        await asyncio.to_thread(blender_server.get_blender_connection)
+    except Exception as exc:
+        logger.warning("Blender add-on is not connected yet: %s", exc)
+        return False
+
+    return _has_blender_connection()
+
+
+async def _disconnect_blender() -> None:
+    connection = blender_server._blender_connection
+    if connection is None:
+        return
+
+    try:
+        await asyncio.to_thread(connection.disconnect)
+    finally:
+        blender_server._blender_connection = None
+
+
+def create_app() -> Starlette:
     """Create the ASGI application exposing MCP and health endpoints."""
     _install_blender_command_serialization()
-
-    # FastMCP's Streamable HTTP application exposes the MCP endpoint at /mcp.
-    app = blender_server.mcp.streamable_http_app()
+    mcp_app = blender_server.mcp.streamable_http_app()
 
     async def healthz(_: Request) -> JSONResponse:
-        connection = blender_server._blender_connection
-        blender_connected = bool(connection is not None and connection.sock is not None)
+        # The add-on can be started after this system service. Connect lazily on
+        # the next health check so no service restart is required.
+        blender_connected = await _ensure_blender_connection()
         return JSONResponse(
             {
                 "status": "ok",
@@ -80,8 +113,24 @@ def create_app():
             }
         )
 
-    app.router.add_route(HEALTH_PATH, healthz, methods=["GET"])
-    return app
+    @asynccontextmanager
+    async def lifespan(_: Starlette) -> AsyncIterator[None]:
+        # Mounted ASGI applications do not run their own lifespan. Run the
+        # FastMCP session manager explicitly, as required by the MCP SDK.
+        async with blender_server.mcp.session_manager.run():
+            await _ensure_blender_connection()
+            try:
+                yield
+            finally:
+                await _disconnect_blender()
+
+    return Starlette(
+        routes=[
+            Route(HEALTH_PATH, healthz, methods=["GET"]),
+            Mount("/", app=mcp_app),
+        ],
+        lifespan=lifespan,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
