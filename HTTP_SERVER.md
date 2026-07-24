@@ -4,14 +4,9 @@ The fork keeps the original stdio mode and adds a standalone Streamable HTTP mod
 
 ## Install
 
-The HTTP mode requires a newer stable MCP Python SDK than the lockfile inherited from upstream. Regenerate the lockfile once, then install:
-
 ```bash
-uv lock
 uv sync
 ```
-
-Commit the resulting `uv.lock` after the first successful local installation.
 
 ## Run
 
