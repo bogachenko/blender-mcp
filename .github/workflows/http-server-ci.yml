@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - "src/blender_mcp/**"
+      - "tests/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/http-server-ci.yml"
@@ -24,7 +25,10 @@ jobs:
         run: uv sync --frozen
 
       - name: Compile Python sources
-        run: uv run python -m compileall -q src
+        run: uv run python -m compileall -q src tests
+
+      - name: Run OAuth compatibility tests
+        run: uv run python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Verify HTTP and OAuth endpoints
         env:
@@ -66,6 +70,22 @@ jobs:
           assert resource['authorization_servers'] == ['https://blender-mcp.example.test']
           assert authorization['issuer'] == 'https://blender-mcp.example.test'
           assert authorization['registration_endpoint'].endswith('/oauth/register')
+          assert authorization['code_challenge_methods_supported'] == ['S256', 'plain']
+          PY
+
+          curl -fsS \
+            -H 'Content-Type: application/json' \
+            -d '{"redirect_uris":["https://chatgpt.com/connector/oauth/callback"],"client_name":"ChatGPT","token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"scope":"blender offline_access","application_type":"web"}' \
+            http://127.0.0.1:1985/oauth/register >/tmp/registration.json
+
+          python - <<'PY'
+          import json
+          with open('/tmp/registration.json', encoding='utf-8') as stream:
+              registration = json.load(stream)
+          assert registration['client_id'].startswith('client_')
+          assert registration['grant_types'] == ['authorization_code']
+          assert registration['response_types'] == ['code']
+          assert registration['token_endpoint_auth_method'] == 'none'
           PY
 
           unauthenticated_status=$(curl -sS -o /tmp/unauthenticated.txt -D /tmp/unauthenticated.headers -w '%{http_code}' http://127.0.0.1:1985/mcp)
