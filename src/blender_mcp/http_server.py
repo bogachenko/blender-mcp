@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 from . import server as blender_server
+from .oauth import OAuthManager
 
 logger = logging.getLogger("BlenderMCPHTTPServer")
 
@@ -95,9 +96,10 @@ async def _disconnect_blender() -> None:
 
 
 def create_app() -> Starlette:
-    """Create the ASGI application exposing MCP and health endpoints."""
+    """Create the ASGI application exposing MCP, OAuth, and health endpoints."""
     _install_blender_command_serialization()
-    mcp_app = blender_server.mcp.streamable_http_app()
+    oauth = OAuthManager.from_environment()
+    mcp_app = oauth.protect(blender_server.mcp.streamable_http_app())
 
     async def healthz(_: Request) -> JSONResponse:
         # The add-on can be started after this system service. Connect lazily on
@@ -110,6 +112,7 @@ def create_app() -> Starlette:
                 "blender_connected": blender_connected,
                 "blender_host": os.getenv("BLENDER_HOST", blender_server.DEFAULT_HOST),
                 "blender_port": int(os.getenv("BLENDER_PORT", str(blender_server.DEFAULT_PORT))),
+                "auth_enabled": oauth.enabled,
             }
         )
 
@@ -124,13 +127,16 @@ def create_app() -> Starlette:
             finally:
                 await _disconnect_blender()
 
-    return Starlette(
+    app = Starlette(
         routes=[
             Route(HEALTH_PATH, healthz, methods=["GET"]),
+            *oauth.routes(),
             Mount("/", app=mcp_app),
         ],
         lifespan=lifespan,
     )
+    app.state.oauth_manager = oauth
+    return app
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -173,6 +179,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
     app = create_app()
+    oauth: OAuthManager = app.state.oauth_manager
+    if oauth.enabled:
+        logger.info("BlenderMCP OAuth protection is enabled")
+    else:
+        logger.warning(
+            "BlenderMCP OAuth protection is disabled. Keep the server loopback-only "
+            "and do not publish it through a tunnel."
+        )
+
     logger.info("BlenderMCP HTTP endpoint: http://%s:%s%s", args.host, args.port, MCP_PATH)
     logger.info("BlenderMCP health endpoint: http://%s:%s%s", args.host, args.port, HEALTH_PATH)
 
