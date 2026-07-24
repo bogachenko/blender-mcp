@@ -1,0 +1,76 @@
+name: HTTP server CI
+
+on:
+  push:
+    branches:
+      - feature/http-server
+  pull_request:
+    paths:
+      - "src/blender_mcp/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/http-server-ci.yml"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Compile Python sources
+        run: uv run python -m compileall -q src
+
+      - name: Verify HTTP and OAuth endpoints
+        env:
+          BLENDER_MCP_OAUTH_OWNER_TOKEN: ci-owner-token
+          BLENDER_MCP_BEARER_TOKEN: ci-static-bearer
+          BLENDER_MCP_PUBLIC_BASE_URL: https://blender-mcp.example.test
+          BLENDER_MCP_OAUTH_STATE_FILE: ${{ runner.temp }}/blender-mcp-oauth-state.json
+        run: |
+          set -euo pipefail
+          uv run blender-mcp serve --host 127.0.0.1 --port 1985 >server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; cat server.log' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:1985/healthz >/tmp/health.json; then
+              break
+            fi
+            sleep 1
+          done
+
+          python - <<'PY'
+          import json
+          with open('/tmp/health.json', encoding='utf-8') as stream:
+              value = json.load(stream)
+          assert value['status'] == 'ok'
+          assert value['auth_enabled'] is True
+          PY
+
+          curl -fsS http://127.0.0.1:1985/.well-known/oauth-protected-resource >/tmp/resource.json
+          curl -fsS http://127.0.0.1:1985/.well-known/oauth-authorization-server >/tmp/authorization.json
+
+          python - <<'PY'
+          import json
+          with open('/tmp/resource.json', encoding='utf-8') as stream:
+              resource = json.load(stream)
+          with open('/tmp/authorization.json', encoding='utf-8') as stream:
+              authorization = json.load(stream)
+          assert resource['resource'] == 'https://blender-mcp.example.test/mcp'
+          assert resource['authorization_servers'] == ['https://blender-mcp.example.test']
+          assert authorization['issuer'] == 'https://blender-mcp.example.test'
+          assert authorization['registration_endpoint'].endswith('/oauth/register')
+          PY
+
+          unauthenticated_status=$(curl -sS -o /tmp/unauthenticated.txt -D /tmp/unauthenticated.headers -w '%{http_code}' http://127.0.0.1:1985/mcp)
+          test "$unauthenticated_status" = "401"
+          grep -qi 'resource_metadata="https://blender-mcp.example.test/.well-known/oauth-protected-resource"' /tmp/unauthenticated.headers
+
+          authenticated_status=$(curl -sS -o /tmp/authenticated.txt -w '%{http_code}' -H 'Authorization: Bearer ci-static-bearer' http://127.0.0.1:1985/mcp)
+          test "$authenticated_status" != "401"
