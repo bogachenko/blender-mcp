@@ -1,9 +1,9 @@
-"""OAuth 2.1-style protection for the standalone BlenderMCP HTTP server.
+"""OAuth protection for the standalone BlenderMCP HTTP server.
 
-The MCP endpoint acts as a protected resource and the same process exposes a
-small authorization server intended for a single-owner, self-hosted instance.
-It supports dynamic client registration, authorization code + PKCE, persistent
-clients/access tokens, and an optional static bearer token for diagnostics.
+This module intentionally follows the same self-hosted OAuth behavior used by
+the user's existing MCP servers: dynamic client registration accepts standard
+client metadata without rejecting extra grant/response declarations, while the
+server advertises and issues authorization-code tokens protected by PKCE.
 """
 
 from __future__ import annotations
@@ -24,7 +24,13 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from starlette.routing import Route
 
 DEFAULT_SCOPE = "blender"
@@ -32,7 +38,14 @@ ACCESS_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 AUTHORIZATION_CODE_TTL_SECONDS = 10 * 60
 MAX_REQUEST_BODY_BYTES = 64 * 1024
 
-ASGIApp = Callable[[dict[str, Any], Callable[[], Awaitable[dict[str, Any]]], Callable[[dict[str, Any]], Awaitable[None]]], Awaitable[None]]
+ASGIApp = Callable[
+    [
+        dict[str, Any],
+        Callable[[], Awaitable[dict[str, Any]]],
+        Callable[[dict[str, Any]], Awaitable[None]],
+    ],
+    Awaitable[None],
+]
 
 
 @dataclass(slots=True)
@@ -69,7 +82,7 @@ class AccessTokenRecord:
 
 
 class OAuthManager:
-    """Owns OAuth configuration, state, HTTP handlers, and MCP authorization."""
+    """Own OAuth configuration, persisted state, routes, and MCP protection."""
 
     def __init__(
         self,
@@ -107,7 +120,9 @@ class OAuthManager:
             "BLENDER_MCP_OAUTH_STATE_FILE",
             "MCP_OAUTH_STATE_FILE",
         )
-        state_file = Path(state_file_value or "~/.config/blender-mcp/oauth-state.json")
+        state_file = Path(
+            state_file_value or "~/.config/blender-mcp/oauth-state.json"
+        )
         return cls(
             owner_token=owner_token,
             static_bearer_token=static_bearer_token,
@@ -121,10 +136,26 @@ class OAuthManager:
 
     def routes(self) -> list[Route]:
         return [
-            Route("/.well-known/oauth-protected-resource", self.protected_resource_metadata, methods=["GET"]),
-            Route("/.well-known/oauth-protected-resource/mcp", self.protected_resource_metadata, methods=["GET"]),
-            Route("/.well-known/oauth-authorization-server", self.authorization_server_metadata, methods=["GET"]),
-            Route("/.well-known/oauth-authorization-server/mcp", self.authorization_server_metadata, methods=["GET"]),
+            Route(
+                "/.well-known/oauth-protected-resource",
+                self.protected_resource_metadata,
+                methods=["GET"],
+            ),
+            Route(
+                "/.well-known/oauth-protected-resource/mcp",
+                self.protected_resource_metadata,
+                methods=["GET"],
+            ),
+            Route(
+                "/.well-known/oauth-authorization-server",
+                self.authorization_server_metadata,
+                methods=["GET"],
+            ),
+            Route(
+                "/.well-known/oauth-authorization-server/mcp",
+                self.authorization_server_metadata,
+                methods=["GET"],
+            ),
             Route("/oauth/register", self.register_client, methods=["POST"]),
             Route("/oauth/authorize", self.authorize, methods=["GET", "POST"]),
             Route("/oauth/token", self.issue_token, methods=["POST"]),
@@ -145,15 +176,20 @@ class OAuthManager:
             if authorization.lower().startswith("bearer "):
                 token = authorization[7:].strip()
 
-            resource = self.canonical_resource_uri(request)
-            if not self.validate_bearer_token(token, resource):
-                metadata_url = self.public_base_url(request) + "/.well-known/oauth-protected-resource"
+            if not self.validate_bearer_token(
+                token,
+                self.canonical_resource_uri(request),
+            ):
+                metadata_url = (
+                    self.public_base_url(request)
+                    + "/.well-known/oauth-protected-resource"
+                )
                 response = PlainTextResponse(
                     "Unauthorized",
                     status_code=401,
                     headers={
                         "WWW-Authenticate": (
-                            f'Bearer resource_metadata="{metadata_url}", scope="{DEFAULT_SCOPE}"'
+                            f'Bearer resource_metadata="{metadata_url}"'
                         ),
                         "Cache-Control": "no-store",
                     },
@@ -179,7 +215,10 @@ class OAuthManager:
             headers={"Cache-Control": "no-store"},
         )
 
-    async def authorization_server_metadata(self, request: Request) -> Response:
+    async def authorization_server_metadata(
+        self,
+        request: Request,
+    ) -> Response:
         base = self.public_base_url(request)
         return JSONResponse(
             {
@@ -189,7 +228,7 @@ class OAuthManager:
                 "registration_endpoint": base + "/oauth/register",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code"],
-                "code_challenge_methods_supported": ["S256"],
+                "code_challenge_methods_supported": ["S256", "plain"],
                 "token_endpoint_auth_methods_supported": [
                     "none",
                     "client_secret_post",
@@ -203,31 +242,59 @@ class OAuthManager:
     async def register_client(self, request: Request) -> Response:
         body = await _read_limited_body(request)
         if body is None:
-            return _oauth_error(413, "invalid_client_metadata", "request body is too large")
+            return _oauth_error(
+                413,
+                "invalid_client_metadata",
+                "request body is too large",
+            )
+
         try:
             value = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return _oauth_error(400, "invalid_client_metadata", "invalid JSON")
+            return _oauth_error(
+                400,
+                "invalid_client_metadata",
+                "invalid JSON",
+            )
         if not isinstance(value, dict):
-            return _oauth_error(400, "invalid_client_metadata", "JSON object is required")
+            return _oauth_error(
+                400,
+                "invalid_client_metadata",
+                "JSON object is required",
+            )
 
         redirect_uris = _clean_string_list(value.get("redirect_uris"))
         if not redirect_uris:
-            return _oauth_error(400, "invalid_redirect_uri", "redirect_uris is required")
+            return _oauth_error(
+                400,
+                "invalid_redirect_uri",
+                "redirect_uris is required",
+            )
         if any(not _is_allowed_redirect_uri(uri) for uri in redirect_uris):
-            return _oauth_error(400, "invalid_redirect_uri", "redirect_uri must use HTTPS or loopback HTTP")
+            return _oauth_error(
+                400,
+                "invalid_redirect_uri",
+                "redirect_uri must use HTTPS or loopback HTTP",
+            )
 
-        grant_types = _clean_string_list(value.get("grant_types"))
-        if grant_types and grant_types != ["authorization_code"]:
-            return _oauth_error(400, "invalid_client_metadata", "only authorization_code is supported")
-        response_types = _clean_string_list(value.get("response_types"))
-        if response_types and response_types != ["code"]:
-            return _oauth_error(400, "invalid_client_metadata", "only code response type is supported")
-
-        auth_method = str(value.get("token_endpoint_auth_method") or "none").strip()
-        allowed_auth_methods = {"none", "client_secret_post", "client_secret_basic"}
+        # Match the existing MCP servers: grant_types, response_types, scope,
+        # and unknown registration fields do not cause registration to fail.
+        # Some clients request refresh_token during registration even when this
+        # single-owner server issues authorization-code access tokens only.
+        auth_method = str(
+            value.get("token_endpoint_auth_method") or "none"
+        ).strip()
+        allowed_auth_methods = {
+            "none",
+            "client_secret_post",
+            "client_secret_basic",
+        }
         if auth_method not in allowed_auth_methods:
-            return _oauth_error(400, "invalid_client_metadata", "unsupported token_endpoint_auth_method")
+            return _oauth_error(
+                400,
+                "invalid_client_metadata",
+                "unsupported token_endpoint_auth_method",
+            )
 
         client = OAuthClient(
             client_id="client_" + secrets.token_urlsafe(24),
@@ -248,23 +315,64 @@ class OAuthManager:
             "redirect_uris": client.redirect_uris,
             "grant_types": ["authorization_code"],
             "response_types": ["code"],
-            "token_endpoint_auth_method": client.token_endpoint_auth_method,
+            "token_endpoint_auth_method": (
+                client.token_endpoint_auth_method
+            ),
             "scope": DEFAULT_SCOPE,
         }
         if auth_method != "none":
             response["client_secret"] = client.client_secret
             response["client_secret_expires_at"] = 0
-        return JSONResponse(response, status_code=201, headers={"Cache-Control": "no-store"})
+
+        return JSONResponse(
+            response,
+            status_code=201,
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def authorize(self, request: Request) -> Response:
         error_message = ""
-        if request.method == "POST":
+
+        if request.method == "GET":
+            supplied_owner_token = request.query_params.get(
+                "owner_token",
+                "",
+            ).strip()
+            if supplied_owner_token:
+                if (
+                    not self.owner_token
+                    or not hmac.compare_digest(
+                        supplied_owner_token,
+                        self.owner_token,
+                    )
+                ):
+                    error_message = "Неверный owner token"
+                else:
+                    return self._complete_authorization(request)
+
+        elif request.method == "POST":
             body = await _read_limited_body(request)
             if body is None:
-                return _oauth_error(413, "invalid_request", "request body is too large")
-            form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
-            supplied_owner_token = _first_form_value(form, "owner_token")
-            if not self.owner_token or not hmac.compare_digest(supplied_owner_token, self.owner_token):
+                return _oauth_error(
+                    413,
+                    "invalid_request",
+                    "request body is too large",
+                )
+            form = parse_qs(
+                body.decode("utf-8", errors="replace"),
+                keep_blank_values=True,
+            )
+            supplied_owner_token = _first_form_value(
+                form,
+                "owner_token",
+            )
+            if (
+                not self.owner_token
+                or not hmac.compare_digest(
+                    supplied_owner_token,
+                    self.owner_token,
+                )
+            ):
                 error_message = "Неверный owner token"
             else:
                 return self._complete_authorization(request)
@@ -278,27 +386,54 @@ class OAuthManager:
         redirect_uri = query.get("redirect_uri", "")
         scope = query.get("scope", "").strip() or DEFAULT_SCOPE
         state = query.get("state", "")
-        resource = query.get("resource", "").strip() or self.canonical_resource_uri(request)
+        resource = (
+            query.get("resource", "").strip()
+            or self.canonical_resource_uri(request)
+        )
         code_challenge = query.get("code_challenge", "").strip()
-        code_challenge_method = query.get("code_challenge_method", "").strip() or "S256"
+        code_challenge_method = (
+            query.get("code_challenge_method", "").strip() or "plain"
+        )
 
         if response_type != "code":
-            return _oauth_error(400, "unsupported_response_type", "response_type must be code")
+            return _oauth_error(
+                400,
+                "unsupported_response_type",
+                "response_type must be code",
+            )
         if not client_id or not redirect_uri:
-            return _oauth_error(400, "invalid_request", "client_id and redirect_uri are required")
+            return _oauth_error(
+                400,
+                "invalid_request",
+                "client_id and redirect_uri are required",
+            )
         if not code_challenge:
-            return _oauth_error(400, "invalid_request", "PKCE code_challenge is required")
-        if code_challenge_method != "S256":
-            return _oauth_error(400, "invalid_request", "code_challenge_method must be S256")
-        if scope != DEFAULT_SCOPE:
-            return _oauth_error(400, "invalid_scope", f"scope must be {DEFAULT_SCOPE}")
+            return _oauth_error(
+                400,
+                "invalid_request",
+                "PKCE code_challenge is required",
+            )
+        if code_challenge_method not in {"S256", "plain"}:
+            return _oauth_error(
+                400,
+                "invalid_request",
+                "unsupported code_challenge_method",
+            )
 
         with self._lock:
             client = self._clients.get(client_id)
         if client is None:
-            return _oauth_error(400, "invalid_client", "unknown client_id")
+            return _oauth_error(
+                400,
+                "invalid_client",
+                "unknown client_id",
+            )
         if redirect_uri not in client.redirect_uris:
-            return _oauth_error(400, "invalid_redirect_uri", "redirect_uri is not registered")
+            return _oauth_error(
+                400,
+                "invalid_redirect_uri",
+                "redirect_uri is not registered",
+            )
 
         code = "code_" + secrets.token_urlsafe(32)
         authorization_code = AuthorizationCode(
@@ -310,27 +445,45 @@ class OAuthManager:
             resource=resource,
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
-            expires_at=int(time.time()) + AUTHORIZATION_CODE_TTL_SECONDS,
+            expires_at=(
+                int(time.time()) + AUTHORIZATION_CODE_TTL_SECONDS
+            ),
         )
         with self._lock:
             self._prune_locked()
             self._codes[code] = authorization_code
 
         parsed_redirect = urlparse(redirect_uri)
-        redirect_query = parse_qs(parsed_redirect.query, keep_blank_values=True)
+        redirect_query = parse_qs(
+            parsed_redirect.query,
+            keep_blank_values=True,
+        )
         redirect_query["code"] = [code]
         if state:
             redirect_query["state"] = [state]
         location = urlunparse(
-            parsed_redirect._replace(query=urlencode(redirect_query, doseq=True))
+            parsed_redirect._replace(
+                query=urlencode(redirect_query, doseq=True)
+            )
         )
-        return RedirectResponse(location, status_code=302, headers={"Cache-Control": "no-store"})
+        return RedirectResponse(
+            location,
+            status_code=302,
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def issue_token(self, request: Request) -> Response:
         body = await _read_limited_body(request)
         if body is None:
-            return _oauth_error(413, "invalid_request", "request body is too large")
-        form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+            return _oauth_error(
+                413,
+                "invalid_request",
+                "request body is too large",
+            )
+        form = parse_qs(
+            body.decode("utf-8", errors="replace"),
+            keep_blank_values=True,
+        )
 
         grant_type = _first_form_value(form, "grant_type")
         code_value = _first_form_value(form, "code")
@@ -348,32 +501,81 @@ class OAuthManager:
             client_secret = basic_client_secret
 
         if grant_type != "authorization_code":
-            return _oauth_error(400, "unsupported_grant_type", "grant_type must be authorization_code")
-        if not code_value or not redirect_uri or not client_id or not code_verifier:
+            return _oauth_error(
+                400,
+                "unsupported_grant_type",
+                "grant_type must be authorization_code",
+            )
+        if (
+            not code_value
+            or not redirect_uri
+            or not client_id
+            or not code_verifier
+        ):
             return _oauth_error(
                 400,
                 "invalid_request",
-                "code, redirect_uri, client_id and code_verifier are required",
+                (
+                    "code, redirect_uri, client_id and code_verifier "
+                    "are required"
+                ),
             )
 
         with self._lock:
             self._prune_locked()
             client = self._clients.get(client_id)
-            authorization_code = self._codes.pop(code_value, None)
+            authorization_code = self._codes.pop(
+                code_value,
+                None,
+            )
 
         if client is None:
-            return _oauth_error(401, "invalid_client", "unknown client_id")
+            return _oauth_error(
+                401,
+                "invalid_client",
+                "unknown client_id",
+            )
         if client.token_endpoint_auth_method != "none":
-            if not hmac.compare_digest(client_secret, client.client_secret):
-                return _oauth_error(401, "invalid_client", "invalid client_secret")
+            if not hmac.compare_digest(
+                client_secret,
+                client.client_secret,
+            ):
+                return _oauth_error(
+                    401,
+                    "invalid_client",
+                    "invalid client_secret",
+                )
         if authorization_code is None:
-            return _oauth_error(400, "invalid_grant", "invalid or expired code")
-        if authorization_code.client_id != client_id or authorization_code.redirect_uri != redirect_uri:
-            return _oauth_error(400, "invalid_grant", "client_id or redirect_uri mismatch")
-        if not _validate_pkce_s256(code_verifier, authorization_code.code_challenge):
-            return _oauth_error(400, "invalid_grant", "invalid code_verifier")
+            return _oauth_error(
+                400,
+                "invalid_grant",
+                "invalid or expired code",
+            )
+        if (
+            authorization_code.client_id != client_id
+            or authorization_code.redirect_uri != redirect_uri
+        ):
+            return _oauth_error(
+                400,
+                "invalid_grant",
+                "client_id or redirect_uri mismatch",
+            )
+        if not _validate_pkce(
+            code_verifier,
+            authorization_code.code_challenge,
+            authorization_code.code_challenge_method,
+        ):
+            return _oauth_error(
+                400,
+                "invalid_grant",
+                "invalid code_verifier",
+            )
 
-        final_resource = resource or authorization_code.resource or self.canonical_resource_uri(request)
+        final_resource = (
+            resource
+            or authorization_code.resource
+            or self.canonical_resource_uri(request)
+        )
         access_token = AccessTokenRecord(
             token="mcp_" + secrets.token_urlsafe(48),
             client_id=client_id,
@@ -395,11 +597,22 @@ class OAuthManager:
             headers={"Cache-Control": "no-store"},
         )
 
-    def validate_bearer_token(self, token: str, resource: str) -> bool:
+    def validate_bearer_token(
+        self,
+        token: str,
+        resource: str,
+    ) -> bool:
         token = token.strip()
         if not token:
             return False
-        if self.static_bearer_token and hmac.compare_digest(token, self.static_bearer_token):
+
+        if (
+            self.static_bearer_token
+            and hmac.compare_digest(
+                token,
+                self.static_bearer_token,
+            )
+        ):
             return True
 
         with self._lock:
@@ -407,6 +620,7 @@ class OAuthManager:
             record = self._tokens.get(token)
             if changed:
                 self._save_state_locked()
+
         if record is None:
             return False
         if not record.resource or not resource:
@@ -416,18 +630,33 @@ class OAuthManager:
     def public_base_url(self, request: Request) -> str:
         if self.configured_public_base_url:
             return self.configured_public_base_url
-        scheme = request.headers.get("x-forwarded-proto", "").strip() or request.url.scheme or "http"
-        host = request.headers.get("x-forwarded-host", "").strip() or request.headers.get("host", "").strip()
+
+        scheme = (
+            request.headers.get("x-forwarded-proto", "").strip()
+            or request.url.scheme
+            or "http"
+        )
+        host = (
+            request.headers.get("x-forwarded-host", "").strip()
+            or request.headers.get("host", "").strip()
+        )
         return f"{scheme}://{host}".rstrip("/")
 
     def canonical_resource_uri(self, request: Request) -> str:
         return self.public_base_url(request) + "/mcp"
 
-    def _authorization_form(self, request: Request, message: str) -> HTMLResponse:
+    def _authorization_form(
+        self,
+        request: Request,
+        message: str,
+    ) -> HTMLResponse:
         escaped_query = html.escape(request.url.query, quote=True)
         escaped_message = ""
         if message:
-            escaped_message = f'<p style="color:#b00020">{html.escape(message)}</p>'
+            escaped_message = (
+                f'<p style="color:#b00020">{html.escape(message)}</p>'
+            )
+
         page = f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -454,30 +683,49 @@ class OAuthManager:
   </div>
 </body>
 </html>"""
-        return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+        return HTMLResponse(
+            page,
+            headers={"Cache-Control": "no-store"},
+        )
 
     def _load_state(self) -> None:
-        path = self.state_file
         try:
-            raw = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
+            raw = self.state_file.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
             return
-        except OSError:
-            return
+
         try:
             data = json.loads(raw)
-            clients = data.get("clients", [])
-            tokens = data.get("tokens", [])
+            raw_clients = data.get("clients", [])
+            raw_tokens = data.get("tokens", [])
+
+            if isinstance(raw_clients, dict):
+                clients = list(raw_clients.values())
+            elif isinstance(raw_clients, list):
+                clients = raw_clients
+            else:
+                clients = []
+
+            if isinstance(raw_tokens, dict):
+                tokens = list(raw_tokens.values())
+            elif isinstance(raw_tokens, list):
+                tokens = raw_tokens
+            else:
+                tokens = []
+
             with self._lock:
                 for item in clients:
+                    if not isinstance(item, dict):
+                        continue
                     client = OAuthClient(**item)
                     self._clients[client.client_id] = client
                 for item in tokens:
+                    if not isinstance(item, dict):
+                        continue
                     token = AccessTokenRecord(**item)
                     self._tokens[token.token] = token
                 self._prune_locked()
         except (TypeError, ValueError, json.JSONDecodeError):
-            # Fail closed for stored credentials without making the local service unavailable.
             self._clients.clear()
             self._tokens.clear()
 
@@ -489,16 +737,37 @@ class OAuthManager:
             os.chmod(parent, 0o700)
         except OSError:
             pass
+
         payload = {
             "version": 1,
-            "clients": [asdict(client) for client in self._clients.values()],
-            "tokens": [asdict(token) for token in self._tokens.values()],
+            "clients": [
+                asdict(client)
+                for client in self._clients.values()
+            ],
+            "tokens": [
+                asdict(token)
+                for token in self._tokens.values()
+            ],
         }
-        fd, temporary_path = tempfile.mkstemp(prefix=".oauth-state-", dir=parent)
+
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=".oauth-state-",
+            dir=parent,
+        )
         try:
             os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            with os.fdopen(
+                fd,
+                "w",
+                encoding="utf-8",
+            ) as stream:
+                json.dump(
+                    payload,
+                    stream,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -512,12 +781,22 @@ class OAuthManager:
 
     def _prune_locked(self) -> bool:
         now = int(time.time())
-        expired_codes = [key for key, value in self._codes.items() if value.expires_at <= now]
-        expired_tokens = [key for key, value in self._tokens.items() if value.expires_at <= now]
+        expired_codes = [
+            key
+            for key, value in self._codes.items()
+            if value.expires_at <= now
+        ]
+        expired_tokens = [
+            key
+            for key, value in self._tokens.items()
+            if value.expires_at <= now
+        ]
+
         for key in expired_codes:
             self._codes.pop(key, None)
         for key in expired_tokens:
             self._tokens.pop(key, None)
+
         return bool(expired_codes or expired_tokens)
 
 
@@ -532,7 +811,11 @@ def _first_environment_value(*names: str) -> str:
 def _clean_string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return [
+        item.strip()
+        for item in value
+        if isinstance(item, str) and item.strip()
+    ]
 
 
 def _is_allowed_redirect_uri(value: str) -> bool:
@@ -540,27 +823,56 @@ def _is_allowed_redirect_uri(value: str) -> bool:
         parsed = urlparse(value)
     except ValueError:
         return False
+
     if parsed.scheme.lower() == "https" and parsed.netloc:
         return True
     if parsed.scheme.lower() != "http":
         return False
-    return (parsed.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+    return (parsed.hostname or "").lower() in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
 
 
 def _normalize_url(value: str) -> str:
     return value.strip().rstrip("/").lower()
 
 
-def _validate_pkce_s256(verifier: str, expected_challenge: str) -> bool:
-    calculated = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("utf-8")).digest()).rstrip(b"=").decode("ascii")
-    return hmac.compare_digest(calculated, expected_challenge)
+def _validate_pkce(
+    verifier: str,
+    expected_challenge: str,
+    method: str,
+) -> bool:
+    if not verifier or not expected_challenge:
+        return False
+
+    if method == "plain":
+        return hmac.compare_digest(verifier, expected_challenge)
+    if method == "S256":
+        calculated = (
+            base64.urlsafe_b64encode(
+                hashlib.sha256(verifier.encode("utf-8")).digest()
+            )
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        return hmac.compare_digest(
+            calculated,
+            expected_challenge,
+        )
+    return False
 
 
 def _parse_basic_client_auth(value: str) -> tuple[str, str]:
     if not value.lower().startswith("basic "):
         return "", ""
+
     try:
-        decoded = base64.b64decode(value[6:].strip()).decode("utf-8")
+        decoded = base64.b64decode(
+            value[6:].strip(),
+            validate=True,
+        ).decode("utf-8")
         client_id, client_secret = decoded.split(":", 1)
         return client_id, client_secret
     except (ValueError, UnicodeDecodeError):
@@ -568,27 +880,41 @@ def _parse_basic_client_auth(value: str) -> tuple[str, str]:
 
 
 async def _read_limited_body(request: Request) -> bytes | None:
-    content_length = request.headers.get("content-length", "").strip()
+    content_length = request.headers.get(
+        "content-length",
+        "",
+    ).strip()
     if content_length:
         try:
             if int(content_length) > MAX_REQUEST_BODY_BYTES:
                 return None
         except ValueError:
             return None
+
     body = await request.body()
     if len(body) > MAX_REQUEST_BODY_BYTES:
         return None
     return body
 
 
-def _first_form_value(form: dict[str, list[str]], name: str) -> str:
+def _first_form_value(
+    form: dict[str, list[str]],
+    name: str,
+) -> str:
     values = form.get(name, [])
     return values[0] if values else ""
 
 
-def _oauth_error(status_code: int, code: str, description: str) -> JSONResponse:
+def _oauth_error(
+    status_code: int,
+    code: str,
+    description: str,
+) -> JSONResponse:
     return JSONResponse(
-        {"error": code, "error_description": description},
+        {
+            "error": code,
+            "error_description": description,
+        },
         status_code=status_code,
         headers={"Cache-Control": "no-store"},
     )
